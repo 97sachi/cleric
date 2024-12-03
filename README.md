@@ -1,5 +1,6 @@
-#Cleric Query Agent Assignment
-#Introduction
+**Cleric Query Agent Assignment**
+
+**Introduction**
 This project implements an AI-powered query agent that interacts with a Kubernetes cluster to answer questions about its deployed applications. The agent uses Flask for serving queries and the Kubernetes Python client for interacting with the cluster.
 
 It supports queries such as:
@@ -8,12 +9,12 @@ The number of pods, nodes, deployments, or services.
 The status of specific pods or deployments.
 Fetching logs for specific pods.
 Details about namespaces, resource quotas, and node names.
-#Features
+**Features**
 Query information from a Kubernetes cluster running on Minikube.
 Handles various Kubernetes resources like pods, nodes, deployments, and services.
 Robust error handling for invalid or unsupported queries.
 Logs all queries and responses in agent.log.
-#Prerequisites
+**Prerequisites**
 To run this project, ensure you have the following installed:
 
 Python: 3.10+
@@ -21,7 +22,7 @@ Docker: Version 20.10+
 Minikube: Version 1.34+
 Kubernetes: Version 1.25+
 pip: Latest version
-#Setup Instructions
+**Setup Instructions**
 Step 1: Clone the Repository
 Clone this repository to your local machine:
 
@@ -66,7 +67,7 @@ Start the Flask app:
 python main.py
 The application will start on http://127.0.0.1:8000.
 
-#Test with curl or any HTTP client:
+**Test with curl or any HTTP client:**
 
 Number of Pods:
 
@@ -85,13 +86,13 @@ All operations are logged in agent.log. Use the following command to view logs:
 
 
 cat agent.log
-#Technical Specifications
+**Technical Specifications**
 Python: 3.10+
 Flask: Lightweight web framework for serving queries.
 Kubernetes Python Client: To interact with the Minikube cluster.
 Minikube: Kubernetes on a local machine (Version 1.34+).
 Docker: Containerization platform (Version 20.10+).
-#Example Queries
+**Example Queries**
 Here are some supported queries:
 
 Pods in Default Namespace:
@@ -110,9 +111,9 @@ Pod Logs:
 
 Query: "What are the logs of the pod named nginx-676b6c5bbc-492q7?"
 Response: "Logs for pod 'nginx-676b6c5bbc-492q7': ..." (truncated).
-Error Handling
+**Error Handling**
 Logs errors in agent.log.
 Returns user-friendly error messages for unsupported or invalid queries.
-#Future Enhancements
+**Future Enhancements**
 Add support for querying resource usage (CPU/Memory).
 Support additional Kubernetes resources like ConfigMaps, Secrets, etc.
