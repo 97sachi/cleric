@@ -29,11 +29,12 @@ except Exception as e:
     logging.error(f"Failed to load Kubernetes config: {e}")
     v1 = None  # Handling cases where Kubernetes client cannot be initialized
     apps_v1 = None
-
+print("hi1")
 # Load OpenAI API key from environment variable
 openai.api_key = os.getenv("OPENAI_API_KEY")
 @app.route('/query', methods=['POST'])
 def create_query():
+    print("hi")
     try:
         # Extracting query from the request data
         request_data = request.json
