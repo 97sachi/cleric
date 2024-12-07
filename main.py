@@ -31,7 +31,7 @@ except Exception as e:
     apps_v1 = None
 
 # Load OpenAI API key from environment variable
-openai.api_key = ""
+openai.api_key = os.getenv("OPENAI_API_KEY")
 @app.route('/query', methods=['POST'])
 def create_query():
     try:
