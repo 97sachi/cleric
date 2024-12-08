@@ -1,7 +1,7 @@
 import logging
 import os
 from flask import Flask, request, jsonify
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from kubernetes import client, config
 import openai
 from dotenv import load_dotenv
@@ -64,71 +64,74 @@ def create_query():
             )
             gpt_analysis = gpt_response['choices'][0]['message']['content'].strip()
             logging.info(f"GPT Analysis: {gpt_analysis}")
-        except (AuthenticationError, RateLimitError, InvalidRequestError, OpenAIError) as e:
-            logging.error(f"OpenAI API error: {e}")
-            return jsonify({"error": f"OpenAI API error: {e}"}), 500
+        except AuthenticationError as e:
+            logging.error(f"OpenAI API Authentication error: {e}")
+            return jsonify({"error": "Authentication error with OpenAI API"}), 401
+        except RateLimitError as e:
+            logging.error(f"OpenAI API Rate limit exceeded: {e}")
+            return jsonify({"error": "Rate limit exceeded for OpenAI API"}), 429
+        except InvalidRequestError as e:
+            logging.error(f"Invalid request to OpenAI API: {e}")
+            return jsonify({"error": "Invalid request to OpenAI API"}), 400
+        except OpenAIError as e:
+            logging.error(f"General OpenAI API error: {e}")
+            return jsonify({"error": "An error occurred with the OpenAI API"}), 500
 
         # Handle specific Kubernetes queries based on GPT analysis
         answer = "Query not recognized."
-        try:
-            if "namespace" in gpt_analysis and "harbor service" in gpt_analysis:
-                services = v1.list_service_for_all_namespaces()
-                harbor_namespace = next(
-                    (svc.metadata.namespace for svc in services.items if "harbor" in svc.metadata.name), None
-                )
-                answer = f"The harbor service is deployed in the '{harbor_namespace}' namespace." if harbor_namespace else "Harbor service not found."
-
-            elif "pods in the cluster" in gpt_analysis:
-                pods = v1.list_pod_for_all_namespaces()
-                answer = f"There are {len(pods.items)} pods in the cluster."
-
-            elif "container port for harbor-core" in gpt_analysis:
-                pods = v1.list_namespaced_pod(namespace="default", label_selector="app=harbor-core")
-                container_ports = pods.items[0].spec.containers[0].ports if pods.items else []
-                harbor_core_port = next((port.container_port for port in container_ports if port.name == "http"), None)
-                answer = f"The container port for harbor-core is {harbor_core_port}." if harbor_core_port else "Harbor-core port not found."
-
-            elif "status of harbor registry" in gpt_analysis:
-                pods = v1.list_namespaced_pod(namespace="default", label_selector="app=harbor-registry")
-                status = pods.items[0].status.phase if pods.items else "Not found"
-                answer = f"The status of the harbor registry is {status}."
-
-            elif "port for the harbor redis svc" in gpt_analysis:
-                service = v1.read_namespaced_service(name="harbor-redis", namespace="default")
-                ports = [port.port for port in service.spec.ports]
-                answer = f"The harbor redis service routes traffic to port {ports[0]}." if ports else "No port found for harbor-redis service."
-
-            elif "readiness probe path for harbor core" in gpt_analysis:
-                pods = v1.list_namespaced_pod(namespace="default", label_selector="app=harbor-core")
-                readiness_probe = pods.items[0].spec.containers[0].readiness_probe.http_get.path if pods.items else "Not found"
-                answer = f"The readiness probe path for harbor-core is '{readiness_probe}'." if readiness_probe else "Readiness probe path not configured."
-
-            elif "harbor database secret" in gpt_analysis:
-                pods = v1.list_pod_for_all_namespaces()
-                associated_pods = [
-                    pod.metadata.name for pod in pods.items
-                    if any(env.name == "harbor-database-secret" for container in pod.spec.containers for env in (container.env or []))
-                ]
-                answer = f"The pods associated with harbor-database-secret are: {', '.join(associated_pods)}." if associated_pods else "No pods associated with harbor-database-secret."
-
-            elif "mount path of the persistent volume" in gpt_analysis:
-                pods = v1.list_namespaced_pod(namespace="default", label_selector="app=harbor-database")
-                mount_paths = [vol_mount.mount_path for vol_mount in pods.items[0].spec.containers[0].volume_mounts]
-                answer = f"The mount path of the persistent volume is: {mount_paths[0]}." if mount_paths else "No mount path found."
-
-            elif "CHART_CACHE_DRIVER in the harbor core pod" in gpt_analysis:
-                pods = v1.list_namespaced_pod(namespace="default", label_selector="app=harbor-core")
-                env_vars = {env.name: env.value for env in pods.items[0].spec.containers[0].env}
-                answer = f"The value of CHART_CACHE_DRIVER is {env_vars.get('CHART_CACHE_DRIVER', 'not set')}."
-
-            elif "name of the database in PostgreSQL" in gpt_analysis:
-                pods = v1.list_namespaced_pod(namespace="default", label_selector="app=harbor-database")
-                db_name_env = [env.value for env in pods.items[0].spec.containers[0].env if env.name == "DATABASE_NAME"]
-                answer = f"The Harbor database name is '{db_name_env[0]}'." if db_name_env else "Database name not found."
-
-        except Exception as e:
-            logging.error(f"Error processing Kubernetes API query: {e}")
-            answer = "An error occurred while processing the query."
+        if "pods" in gpt_analysis and "default namespace" in gpt_analysis:
+            pods = v1.list_namespaced_pod(namespace="default")
+            answer = f"There are {len(pods.items)} pods in the default namespace."
+        elif "nodes" in gpt_analysis:
+            nodes = v1.list_node()
+            answer = f"There are {len(nodes.items)} nodes in the cluster."
+        elif "status of the pod" in gpt_analysis:
+            try:
+                pod_name = query.split("pod named ")[1].strip(" '\"?")
+                pod = v1.read_namespaced_pod(name=pod_name, namespace="default")
+                answer = f"The status of the pod '{pod_name}' is {pod.status.phase}."
+            except IndexError:
+                answer = "Pod name not provided in the query."
+            except client.exceptions.ApiException:
+                answer = f"Pod '{pod_name}' not found in the default namespace."
+        elif "deployments" in gpt_analysis and "default namespace" in gpt_analysis:
+            deployments = apps_v1.list_namespaced_deployment(namespace="default")
+            answer = f"There are {len(deployments.items)} deployments in the default namespace."
+        elif "services" in gpt_analysis and "default namespace" in gpt_analysis:
+            services = v1.list_namespaced_service(namespace="default")
+            answer = f"There are {len(services.items)} services in the default namespace."
+        elif "logs of the pod" in gpt_analysis:
+            try:
+                pod_name = query.split("pod named ")[1].strip(" '\"?")
+                logs = v1.read_namespaced_pod_log(name=pod_name, namespace="default")
+                answer = f"Logs for pod '{pod_name}':\n{logs[:200]}..."
+            except client.exceptions.ApiException:
+                answer = f"Could not fetch logs for pod '{pod_name}'."
+        elif "namespaces" in gpt_analysis:
+            namespaces = v1.list_namespace()
+            answer = f"There are {len(namespaces.items)} namespaces in the cluster."
+        elif "describe the deployment" in gpt_analysis:
+            try:
+                deployment_name = query.split("deployment named ")[1].strip(" '\"?")
+                deployment = apps_v1.read_namespaced_deployment(name=deployment_name, namespace="default")
+                answer = f"Deployment '{deployment_name}':\nReplicas: {deployment.spec.replicas}, Strategy: {deployment.spec.strategy.type}"
+            except client.exceptions.ApiException:
+                answer = f"Could not describe deployment '{deployment_name}'."
+        elif "names of the nodes" in gpt_analysis:
+            nodes = v1.list_node()
+            node_names = [node.metadata.name for node in nodes.items]
+            answer = f"Nodes in the cluster: {', '.join(node_names)}"
+        elif "resource quota" in gpt_analysis and "default namespace" in gpt_analysis:
+            quotas = v1.list_namespaced_resource_quota(namespace="default")
+            answer = f"Resource quota for default namespace:\n{quotas.items[0].status.hard}" if quotas.items else "No resource quota set."
+        elif "pods" in gpt_analysis and "Running" in gpt_analysis:
+            pods = v1.list_namespaced_pod(namespace="default")
+            running_pods = [pod for pod in pods.items if pod.status.phase == "Running"]
+            answer = f"There are {len(running_pods)} Running pods in the default namespace."
+        elif "pods" in gpt_analysis and "label" in gpt_analysis:
+            label = query.split("label ")[1].strip(" '\"?")
+            pods = v1.list_namespaced_pod(namespace="default", label_selector=label)
+            answer = f"There are {len(pods.items)} pods with label '{label}' in the default namespace."
 
         # Return the answer
         logging.info(f"Generated answer: {answer}")
