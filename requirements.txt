@@ -1,5 +1,6 @@
+requests
 Flask
 pydantic
-requests
-openai
 kubernetes
+openai==0.27.8
+python-dotenv
