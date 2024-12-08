@@ -1,43 +1,21 @@
-import logging
 import os
-import json
+import logging
 from flask import Flask, request, jsonify
 from pydantic import BaseModel, ValidationError
+from typing import Optional
 from kubernetes import client, config
+from kubernetes.client.rest import ApiException
 import openai
-from dotenv import load_dotenv
-from openai.error import AuthenticationError, RateLimitError, InvalidRequestError, OpenAIError
 
-# Load environment variables
-load_dotenv()
+# Initialize Flask app
+app = Flask(__name__)
 
 # Configure logging
 logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s %(levelname)s - %(message)s',
     filename='agent.log',
-    filemode='a'
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(message)s',
 )
-
-app = Flask(__name__)
-
-# Pydantic model for the response
-class QueryResponse(BaseModel):
-    query: str
-    answer: str
-
-# Load Kubernetes configuration
-try:
-    config.load_kube_config()  # Ensure kubeconfig is set up correctly
-    v1 = client.CoreV1Api()
-    apps_v1 = client.AppsV1Api()  # Adding AppsV1Api for deployments queries
-except Exception as e:
-    logging.error(f"Failed to load Kubernetes config: {e}")
-    v1 = None
-    apps_v1 = None
-
-# Load OpenAI API key from environment variable
-openai.api_key = os.getenv("OPENAI_API_KEY")
 
 # Define possible intents
 INTENTS = {
@@ -56,11 +34,37 @@ INTENTS = {
     "GetEnvironmentVariable",
     "GetVolumeMountPath",
     "GetPodsAssociatedWithSecret",
+    "GetServiceNamespace",
+    "GetDeploymentStatus",
     "Unknown"
 }
 
-# Define available components for better classification
+# Define available components
 COMPONENTS = ["core", "database", "jobservice", "portal", "redis", "registry", "trivy"]
+
+# Define the response model
+class QueryResponse(BaseModel):
+    query: str
+    answer: str
+
+# Load environment variables
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+
+if not OPENAI_API_KEY:
+    logging.error("OpenAI API key not found in environment variables.")
+    raise ValueError("OpenAI API key not found in environment variables.")
+
+openai.api_key = OPENAI_API_KEY
+
+# Initialize Kubernetes client
+try:
+    config.load_kube_config()  # For local development
+    v1 = client.CoreV1Api()
+    apps_v1 = client.AppsV1Api()
+except Exception as e:
+    logging.error(f"Failed to initialize Kubernetes client: {e}")
+    v1 = None
+    apps_v1 = None
 
 def classify_query(query):
     prompt = f"""
@@ -82,6 +86,8 @@ You are a Kubernetes assistant. Classify the following user query into one of th
 - GetEnvironmentVariable
 - GetVolumeMountPath
 - GetPodsAssociatedWithSecret
+- GetServiceNamespace
+- GetDeploymentStatus
 
 ### Available Components:
 {', '.join(COMPONENTS)}
@@ -158,6 +164,62 @@ If the query does not match any of the above intents, classify it as "Unknown".
     }}
 }}
 
+#### Query:
+"Which namespace is the harbor service deployed to?"
+
+#### Response:
+{{
+    "intent": "GetServiceNamespace",
+    "parameters": {{
+        "service_name": "harbor"
+    }}
+}}
+
+#### Query:
+"How many pods are in the cluster?"
+
+#### Response:
+{{
+    "intent": "ListPods",
+    "parameters": {{
+        "namespace": "all"
+    }}
+}}
+
+#### Query:
+"What is the status of harbor registry?"
+
+#### Response:
+{{
+    "intent": "GetDeploymentStatus",
+    "parameters": {{
+        "deployment_name": "harbor-registry",
+        "namespace": "default"
+    }}
+}}
+
+#### Query:
+"Which port will the harbor redis svc route traffic to?"
+
+#### Response:
+{{
+    "intent": "GetContainerPort",
+    "parameters": {{
+        "component": "harbor-redis"
+    }}
+}}
+
+#### Query:
+"What is the readiness probe path for the harbor core?"
+
+#### Response:
+{{
+    "intent": "GetReadinessProbePath",
+    "parameters": {{
+        "component": "core"
+    }}
+}}
+
 ### User Query:
 "{query}"
 
@@ -176,7 +238,6 @@ If the query does not match any of the above intents, classify it as "Unknown".
     }}
 }}
 """
-
     try:
         response = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
@@ -184,33 +245,21 @@ If the query does not match any of the above intents, classify it as "Unknown".
                 {"role": "system", "content": prompt}
             ],
             max_tokens=150,
-            temperature=0.0,  # For deterministic output
+            temperature=0.0,
             n=1,
             stop=None
         )
-        content = response['choices'][0]['message']['content'].strip()
-        logging.debug(f"GPT Classification Response: {content}")
-        
-        # Safely parse the JSON response
-        classification = json.loads(content)
-        intent = classification.get("intent", "Unknown")
-        parameters = classification.get("parameters", {})
-        
-        logging.debug(f"Extracted Intent: {intent}")
-        logging.debug(f"Extracted Parameters: {parameters}")
-        
-        return intent, parameters
-    except json.JSONDecodeError as e:
-        logging.error(f"JSON decode error: {e}")
-        return "Unknown", {}
+        classification = response['choices'][0]['message']['content']
+        logging.debug(f"GPT Classification Response: {classification}")
+        return classification
     except Exception as e:
-        logging.error(f"Error during GPT classification: {e}")
-        return "Unknown", {}
+        logging.error(f"Error during OpenAI API call: {e}")
+        return '{"intent": "Unknown", "parameters": {}}'
 
 def validate_parameters(intent, parameters):
     if intent in ["GetContainerPort", "GetReadinessProbePath", "GetEnvironmentVariable", "GetVolumeMountPath"]:
         component = parameters.get("component", "").lower()
-        valid_components = COMPONENTS
+        valid_components = COMPONENTS + ["harbor-redis"]  # Added "harbor-redis" as valid component
         if component not in valid_components:
             return False, f"Invalid component name '{component}'. Valid components are: {', '.join(valid_components)}."
     elif intent == "GetPodsAssociatedWithSecret":
@@ -221,6 +270,10 @@ def validate_parameters(intent, parameters):
         pod_name = parameters.get("pod_name", "").strip()
         if not pod_name:
             return False, "Pod name not provided in the query."
+    elif intent in ["GetServiceNamespace", "DescribeDeployment", "GetDeploymentStatus"]:
+        deployment_name = parameters.get("deployment_name", "").strip()
+        if not deployment_name:
+            return False, "Deployment name not provided in the query."
     # Add more validation rules as needed for other intents
     return True, ""
 
@@ -246,7 +299,11 @@ def create_query():
             return jsonify({"error": "Kubernetes client not initialized"}), 500
 
         # Classify the query using GPT
-        intent, params = classify_query(query)
+        classification = classify_query(query)
+        # Parse the JSON response
+        classification_json = client.utils.json.loads(classification)
+        intent = classification_json.get("intent", "Unknown")
+        params = classification_json.get("parameters", {})
         logging.info(f"Classified intent: {intent}, parameters: {params}")
 
         # Validate parameters
@@ -271,8 +328,29 @@ def create_query():
 
         elif intent == "ListPods":
             namespace = params.get("namespace", "default")
-            pods = v1.list_namespaced_pod(namespace=namespace)
-            answer = f"There are {len(pods.items)} pods in the '{namespace}' namespace."
+            if namespace.lower() == "all":
+                try:
+                    pods = v1.list_pod_for_all_namespaces()
+                    pod_count = len(pods.items)
+                    answer = f"There are {pod_count} pods in the entire cluster."
+                except Exception as e:
+                    logging.error(f"Error fetching pods across all namespaces: {e}")
+                    answer = "An error occurred while fetching pods across all namespaces."
+            else:
+                try:
+                    # Verify if the namespace exists
+                    v1.read_namespace(name=namespace)
+                    pods = v1.list_namespaced_pod(namespace=namespace)
+                    pod_count = len(pods.items)
+                    answer = f"There are {pod_count} pods in the '{namespace}' namespace."
+                except ApiException as e:
+                    if e.status == 404:
+                        answer = f"Namespace '{namespace}' not found."
+                    else:
+                        answer = f"An error occurred: {e.reason}"
+                except Exception as e:
+                    logging.error(f"Error fetching pods in namespace '{namespace}': {e}")
+                    answer = "An error occurred while fetching pods."
 
         elif intent == "ListNodes":
             nodes = v1.list_node()
@@ -285,20 +363,67 @@ def create_query():
                 try:
                     pod = v1.read_namespaced_pod(name=pod_name, namespace=namespace)
                     answer = f"The status of the pod '{pod_name}' in namespace '{namespace}' is {pod.status.phase}."
-                except client.exceptions.ApiException as e:
-                    answer = f"Pod '{pod_name}' not found in the namespace '{namespace}'."
+                except ApiException as e:
+                    if e.status == 404:
+                        answer = f"Pod '{pod_name}' not found in the namespace '{namespace}'."
+                    else:
+                        answer = f"An error occurred: {e.reason}"
+                except Exception as e:
+                    logging.error(f"Error fetching pod status: {e}")
+                    answer = "An error occurred while fetching pod status."
             else:
                 answer = "Pod name not provided in the query."
 
         elif intent == "ListDeployments":
             namespace = params.get("namespace", "default")
-            deployments = apps_v1.list_namespaced_deployment(namespace=namespace)
-            answer = f"There are {len(deployments.items)} deployments in the '{namespace}' namespace."
+            try:
+                deployments = apps_v1.list_namespaced_deployment(namespace=namespace)
+                deployment_count = len(deployments.items)
+                answer = f"There are {deployment_count} deployments in the '{namespace}' namespace."
+            except ApiException as e:
+                if e.status == 404:
+                    answer = f"Namespace '{namespace}' not found."
+                else:
+                    answer = f"An error occurred: {e.reason}"
+            except Exception as e:
+                logging.error(f"Error fetching deployments in namespace '{namespace}': {e}")
+                answer = "An error occurred while fetching deployments."
 
         elif intent == "ListServices":
-            namespace = params.get("namespace", "default")
-            services = v1.list_namespaced_service(namespace=namespace)
-            answer = f"There are {len(services.items)} services in the '{namespace}' namespace."
+            service_name = params.get("service_name")
+            if service_name:
+                try:
+                    # Search for the service across all namespaces
+                    services = v1.list_service_for_all_namespaces()
+                    found = False
+                    for svc in services.items:
+                        if svc.metadata.name.lower() == service_name.lower():
+                            namespace = svc.metadata.namespace
+                            answer = f"The service '{service_name}' is deployed in the '{namespace}' namespace."
+                            found = True
+                            break
+                    if not found:
+                        answer = f"Service '{service_name}' not found in any namespace."
+                except Exception as e:
+                    logging.error(f"Error fetching service details: {e}")
+                    answer = "An error occurred while fetching the service details."
+            else:
+                # If no service_name is provided, list services in a specified namespace
+                namespace = params.get("namespace", "default")
+                try:
+                    # Verify if the namespace exists
+                    v1.read_namespace(name=namespace)
+                    services = v1.list_namespaced_service(namespace=namespace)
+                    service_count = len(services.items)
+                    answer = f"There are {service_count} services in the '{namespace}' namespace."
+                except ApiException as e:
+                    if e.status == 404:
+                        answer = f"Namespace '{namespace}' not found."
+                    else:
+                        answer = f"An error occurred: {e.reason}"
+                except Exception as e:
+                    logging.error(f"Error fetching services in namespace '{namespace}': {e}")
+                    answer = "An error occurred while fetching services."
 
         elif intent == "GetPodLogs":
             pod_name = params.get("pod_name")
@@ -306,9 +431,16 @@ def create_query():
             if pod_name:
                 try:
                     logs = v1.read_namespaced_pod_log(name=pod_name, namespace=namespace)
-                    answer = f"Logs for pod '{pod_name}' in namespace '{namespace}':\n{logs[:200]}..."
-                except client.exceptions.ApiException as e:
-                    answer = f"Could not fetch logs for pod '{pod_name}' in namespace '{namespace}'."
+                    # Limit logs to the first 1000 characters for brevity
+                    answer = f"Logs for pod '{pod_name}' in namespace '{namespace}':\n{logs[:1000]}{'...' if len(logs) > 1000 else ''}"
+                except ApiException as e:
+                    if e.status == 404:
+                        answer = f"Pod '{pod_name}' not found in the namespace '{namespace}'."
+                    else:
+                        answer = f"Could not fetch logs: {e.reason}"
+                except Exception as e:
+                    logging.error(f"Error fetching pod logs: {e}")
+                    answer = "An error occurred while fetching pod logs."
             else:
                 answer = "Pod name not provided in the query."
 
@@ -321,8 +453,14 @@ def create_query():
                     replicas = deployment.spec.replicas
                     strategy = deployment.spec.strategy.type
                     answer = f"Deployment '{deployment_name}' in namespace '{namespace}':\nReplicas: {replicas}, Strategy: {strategy}"
-                except client.exceptions.ApiException as e:
-                    answer = f"Could not describe deployment '{deployment_name}' in namespace '{namespace}'."
+                except ApiException as e:
+                    if e.status == 404:
+                        answer = f"Deployment '{deployment_name}' not found in the namespace '{namespace}'."
+                    else:
+                        answer = f"Could not describe deployment: {e.reason}"
+                except Exception as e:
+                    logging.error(f"Error describing deployment: {e}")
+                    answer = "An error occurred while describing the deployment."
             else:
                 answer = "Deployment name not provided in the query."
 
@@ -333,25 +471,42 @@ def create_query():
 
         elif intent == "GetResourceQuota":
             namespace = params.get("namespace", "default")
-            quotas = v1.list_namespaced_resource_quota(namespace=namespace)
-            if quotas.items:
-                hard_limits = quotas.items[0].status.hard
-                formatted_limits = "\n".join([f"{key}: {value}" for key, value in hard_limits.items()])
-                answer = f"Resource quota for namespace '{namespace}':\n{formatted_limits}"
-            else:
-                answer = f"No resource quota set for namespace '{namespace}'."
+            try:
+                quotas = v1.list_namespaced_resource_quota(namespace=namespace)
+                if quotas.items:
+                    hard_limits = quotas.items[0].status.hard
+                    formatted_limits = "\n".join([f"{key}: {value}" for key, value in hard_limits.items()])
+                    answer = f"Resource quota for namespace '{namespace}':\n{formatted_limits}"
+                else:
+                    answer = f"No resource quota set for namespace '{namespace}'."
+            except ApiException as e:
+                if e.status == 404:
+                    answer = f"Namespace '{namespace}' not found."
+                else:
+                    answer = f"An error occurred: {e.reason}"
+            except Exception as e:
+                logging.error(f"Error fetching resource quotas: {e}")
+                answer = "An error occurred while fetching resource quotas."
 
         elif intent == "GetContainerPort":
             component = params.get("component")
             if component:
                 try:
+                    # Normalize component name
+                    component_normalized = component.lower()
+                    # Search for the deployment with the specified component
                     deployments = apps_v1.list_namespaced_deployment(namespace="default")
                     for deploy in deployments.items:
-                        if deploy.metadata.labels.get("app.kubernetes.io/component") == component:
-                            ports = deploy.spec.template.spec.containers[0].ports
-                            port_info = ", ".join([f"{p.container_port}/{p.protocol}" for p in ports])
-                            answer = f"The container port(s) for '{component}' are: {port_info}"
-                            break
+                        deploy_component = deploy.metadata.labels.get("app.kubernetes.io/component", "").lower()
+                        if deploy_component == component_normalized:
+                            containers = deploy.spec.template.spec.containers
+                            if containers:
+                                container = containers[0]
+                                ports = container.ports
+                                if ports:
+                                    port_info = ", ".join([f"{p.container_port}/{p.protocol}" for p in ports])
+                                    answer = f"The container port(s) for '{component}' are: {port_info}"
+                                    break
                     else:
                         answer = f"No deployment found for component '{component}'."
                 except Exception as e:
@@ -364,16 +519,19 @@ def create_query():
             component = params.get("component")
             if component:
                 try:
+                    component_normalized = component.lower()
                     deployments = apps_v1.list_namespaced_deployment(namespace="default")
                     for deploy in deployments.items:
-                        if deploy.metadata.labels.get("app.kubernetes.io/component") == component:
-                            readiness_probe = deploy.spec.template.spec.containers[0].readiness_probe
-                            if readiness_probe and readiness_probe.http_get:
-                                path = readiness_probe.http_get.path
-                            else:
-                                path = "N/A"
-                            answer = f"The readiness probe path for '{component}' is: {path}"
-                            break
+                        deploy_component = deploy.metadata.labels.get("app.kubernetes.io/component", "").lower()
+                        if deploy_component == component_normalized:
+                            containers = deploy.spec.template.spec.containers
+                            if containers:
+                                container = containers[0]
+                                readiness_probe = container.readiness_probe
+                                if readiness_probe and readiness_probe.http_get:
+                                    path = readiness_probe.http_get.path
+                                    answer = f"The readiness probe path for '{component}' is: {path}"
+                                    break
                     else:
                         answer = f"No deployment found for component '{component}'."
                 except Exception as e:
@@ -382,78 +540,25 @@ def create_query():
             else:
                 answer = "Component name not provided in the query."
 
-        elif intent == "GetEnvironmentVariable":
-            component = params.get("component")
-            env_var = params.get("env_var")
-            if component and env_var:
+        elif intent == "GetDeploymentStatus":
+            deployment_name = params.get("deployment_name")
+            namespace = params.get("namespace", "default")
+            if deployment_name:
                 try:
-                    deployments = apps_v1.list_namespaced_deployment(namespace="default")
-                    for deploy in deployments.items:
-                        if deploy.metadata.labels.get("app.kubernetes.io/component") == component:
-                            containers = deploy.spec.template.spec.containers
-                            if containers:
-                                container = containers[0]
-                                for env in container.env:
-                                    if env.name == env_var:
-                                        answer = f"The environment variable `{env_var}` in the '{component}' pod is set to `{env.value}`."
-                                        break
-                                else:
-                                    answer = f"Environment variable `{env_var}` not found in the '{component}' pod."
-                                break
+                    deployment = apps_v1.read_namespaced_deployment(name=deployment_name, namespace=namespace)
+                    available_replicas = deployment.status.available_replicas or 0
+                    desired_replicas = deployment.spec.replicas or 0
+                    answer = f"Deployment '{deployment_name}' in namespace '{namespace}' has {available_replicas}/{desired_replicas} replicas available."
+                except ApiException as e:
+                    if e.status == 404:
+                        answer = f"Deployment '{deployment_name}' not found in the namespace '{namespace}'."
                     else:
-                        answer = f"No deployment found for component '{component}'."
+                        answer = f"Could not fetch deployment status: {e.reason}"
                 except Exception as e:
-                    logging.error(f"Error fetching environment variable: {e}")
-                    answer = "An error occurred while fetching the environment variable."
+                    logging.error(f"Error fetching deployment status: {e}")
+                    answer = "An error occurred while fetching deployment status."
             else:
-                answer = "Component name or environment variable not provided in the query."
-
-        elif intent == "GetVolumeMountPath":
-            component = params.get("component")
-            if component:
-                try:
-                    deployments = apps_v1.list_namespaced_deployment(namespace="default")
-                    for deploy in deployments.items:
-                        if deploy.metadata.labels.get("app.kubernetes.io/component") == component:
-                            containers = deploy.spec.template.spec.containers
-                            if containers:
-                                container = containers[0]
-                                volume_mounts = container.volume_mounts
-                                if volume_mounts:
-                                    mount_paths = ", ".join([vm.mount_path for vm in volume_mounts])
-                                    answer = f"The mount path(s) for the persistent volume in '{component}' are: {mount_paths}"
-                                else:
-                                    answer = f"No volume mounts found for component '{component}'."
-                                break
-                    else:
-                        answer = f"No deployment found for component '{component}'."
-                except Exception as e:
-                    logging.error(f"Error fetching volume mount paths: {e}")
-                    answer = "An error occurred while fetching volume mount paths."
-            else:
-                answer = "Component name not provided in the query."
-
-        elif intent == "GetPodsAssociatedWithSecret":
-            secret_name = params.get("secret_name")
-            if secret_name:
-                try:
-                    # Find all pods across all namespaces that use the specified secret
-                    pods = v1.list_pod_for_all_namespaces(watch=False)
-                    associated_pods = []
-                    for pod in pods.items:
-                        for volume in pod.spec.volumes:
-                            if volume.secret and volume.secret.secret_name == secret_name:
-                                associated_pods.append(f"{pod.metadata.namespace}/{pod.metadata.name}")
-                    if associated_pods:
-                        pods_list = ", ".join(associated_pods)
-                        answer = f"The pod(s) associated with the secret '{secret_name}' are: {pods_list}."
-                    else:
-                        answer = f"No pods are associated with the secret '{secret_name}'."
-                except Exception as e:
-                    logging.error(f"Error fetching pods associated with secret: {e}")
-                    answer = "An error occurred while fetching pods associated with the secret."
-            else:
-                answer = "Secret name not provided in the query."
+                answer = "Deployment name not provided in the query."
 
         elif intent == "Unknown":
             answer = "I'm sorry, I didn't understand your query. Could you please rephrase it?"
@@ -473,5 +578,5 @@ def create_query():
         logging.error(f"Unexpected error: {e}")
         return jsonify({"error": "An unexpected error occurred"}), 500
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8000)
