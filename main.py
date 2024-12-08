@@ -4,6 +4,11 @@ from flask import Flask, request, jsonify
 from pydantic import BaseModel, ValidationError
 from kubernetes import client, config
 import openai
+from dotenv import load_dotenv
+from openai.error import AuthenticationError, RateLimitError, InvalidRequestError, OpenAIError
+
+# Load environment variables
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(
@@ -22,21 +27,21 @@ class QueryResponse(BaseModel):
 
 # Load Kubernetes configuration
 try:
-    config.load_kube_config()  # Ensuring kubeconfig is set up correctly
+    config.load_kube_config()  # Ensure kubeconfig is set up correctly
     v1 = client.CoreV1Api()
     apps_v1 = client.AppsV1Api()  # Adding AppsV1Api for deployments queries
 except Exception as e:
     logging.error(f"Failed to load Kubernetes config: {e}")
-    v1 = None  # Handling cases where Kubernetes client cannot be initialized
+    v1 = None
     apps_v1 = None
 
 # Load OpenAI API key from environment variable
 openai.api_key = os.getenv("OPENAI_API_KEY")
+
 @app.route('/query', methods=['POST'])
 def create_query():
-    
     try:
-        # Extracting query from the request data
+        # Extract query from the request data
         request_data = request.json
         query = request_data.get('query', "")
         logging.info(f"Received query: {query}")
@@ -59,9 +64,18 @@ def create_query():
             )
             gpt_analysis = gpt_response['choices'][0]['message']['content'].strip()
             logging.info(f"GPT Analysis: {gpt_analysis}")
-        except openai.error.OpenAIError as e:
-            logging.error(f"OpenAI API error: {e}")
-            return jsonify({"error": "OpenAI API error occurred"}), 500
+        except AuthenticationError as e:
+            logging.error(f"OpenAI API Authentication error: {e}")
+            return jsonify({"error": "Authentication error with OpenAI API"}), 401
+        except RateLimitError as e:
+            logging.error(f"OpenAI API Rate limit exceeded: {e}")
+            return jsonify({"error": "Rate limit exceeded for OpenAI API"}), 429
+        except InvalidRequestError as e:
+            logging.error(f"Invalid request to OpenAI API: {e}")
+            return jsonify({"error": "Invalid request to OpenAI API"}), 400
+        except OpenAIError as e:
+            logging.error(f"General OpenAI API error: {e}")
+            return jsonify({"error": "An error occurred with the OpenAI API"}), 500
 
         # Handle specific Kubernetes queries based on GPT analysis
         answer = "Query not recognized."
