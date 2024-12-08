@@ -3,8 +3,11 @@ from flask import Flask, request, jsonify
 from pydantic import BaseModel, ValidationError
 from kubernetes import client, config
 import openai
+from dotenv import load_dotenv
+import os
  
 # Configure logging
+load_dotenv()
 logging.basicConfig(level=logging.DEBUG,
                     format='%(asctime)s %(levelname)s - %(message)s',
                     filename='agent.log', filemode='a')
@@ -26,21 +29,39 @@ class QueryResponse(BaseModel):
 def handle_kubernetes_query(query: str) -> str:
     try:
         v1 = client.CoreV1Api()
+       
+        # Check for Harbor registry status
+        print("Query is ", query)
+        if "harbor" in query:
+            print("Query has harbor")
+            # Assuming Harbor is deployed as a service or pod, you can query for its status
+            services = v1.list_service_for_all_namespaces()
+            harbor_service = next((service for service in services.items if "harbor" in service.metadata.name.lower()), None)
+            if harbor_service:
+                return f"The Harbor registry service '{harbor_service.metadata.name}' is running in the cluster."
+            else:
+                return "The Harbor registry service is not found in the cluster."
+       
+        # Check for pods in the default namespace
         if "pods" in query and "default namespace" in query:
             pods = v1.list_namespaced_pod(namespace="default")
             return f"There are {len(pods.items)} pods in the default namespace."
+       
+        # Check for services in the cluster
         elif "services" in query:
             services = v1.list_service_for_all_namespaces()
             return f"There are {len(services.items)} services in the cluster."
+       
+        # Check for namespaces in the cluster
         elif "namespaces" in query:
             namespaces = v1.list_namespace()
             return f"The cluster has {len(namespaces.items)} namespaces."
+       
         else:
             return "I'm unable to process this query. Please rephrase or provide more context."
     except Exception as e:
         logging.error(f"Error processing Kubernetes query: {e}")
         return "There was an error interacting with the Kubernetes cluster."
- 
  
 @app.route('/query', methods=['POST'])
 def create_query():
@@ -75,7 +96,7 @@ def create_query():
         answer = handle_kubernetes_query(gpt_analysis)
         print("Answer is ", answer)
         # Create the response model
-        response = QueryResponse(query=query, answer=answer)
+        response = QueryResponse(query=query, answer=gpt_analysis)
         print("Response is ", response)
         logging.info(f"Generated answer: {answer}")
         return jsonify(response.dict())
