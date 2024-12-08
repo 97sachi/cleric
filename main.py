@@ -96,7 +96,7 @@ def create_query():
         answer = handle_kubernetes_query(gpt_analysis)
         print("Answer is ", answer)
         # Create the response model
-        response = QueryResponse(query=query, answer=gpt_analysis)
+        response = QueryResponse(query=query, answer=answer)
         print("Response is ", response)
         logging.info(f"Generated answer: {answer}")
         return jsonify(response.dict())
@@ -106,4 +106,3 @@ def create_query():
  
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)
-has context menu
